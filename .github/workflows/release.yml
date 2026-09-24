@@ -1,0 +1,205 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and package for Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -e "mentohust-modern[build]"
+
+      - name: Run tests
+        run: python -m unittest discover -s .\mentohust-modern\tests -t .\mentohust-modern
+
+      - name: Build application
+        shell: pwsh
+        run: ./mentohust-modern/tools/build_exe.ps1
+
+      - name: Smoke test packaged CLI
+        shell: pwsh
+        run: |
+          & "./dist/mentohust-modern-cli/mentohust-modern-cli.exe" --help
+          & "./dist/mentohust-modern-cli/mentohust-modern-cli.exe" --config "$env:RUNNER_TEMP\mentohust-cli.json" --init-config
+          $config = Get-Content -LiteralPath "$env:RUNNER_TEMP\mentohust-cli.json" -Raw | ConvertFrom-Json
+          if ($config.dhcp_script -ne '' -or $config.client_exe -ne '') { throw 'CLI JSON defaults are not portable' }
+
+      - name: Create release archive and checksum
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $archiveName = "MentoHUST-Win-Modern-$env:RELEASE_TAG-windows-x64.zip"
+          $cliArchiveName = "MentoHUST-Win-Modern-$env:RELEASE_TAG-windows-x64-cli.zip"
+          Compress-Archive -Path "dist\MentoHUST Win Modern" -DestinationPath $archiveName
+          Compress-Archive -Path "dist\mentohust-modern-cli" -DestinationPath $cliArchiveName
+          $checksum = (Get-FileHash -LiteralPath $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  $archiveName" | Set-Content -LiteralPath "$archiveName.sha256" -Encoding ascii
+          $cliChecksum = (Get-FileHash -LiteralPath $cliArchiveName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$cliChecksum  $cliArchiveName" | Set-Content -LiteralPath "$cliArchiveName.sha256" -Encoding ascii
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: MentoHUST-Win-Modern-${{ github.ref_name }}-windows-x64
+          path: |
+            MentoHUST-Win-Modern-${{ github.ref_name }}-windows-x64.zip
+            MentoHUST-Win-Modern-${{ github.ref_name }}-windows-x64.zip.sha256
+            MentoHUST-Win-Modern-${{ github.ref_name }}-windows-x64-cli.zip
+            MentoHUST-Win-Modern-${{ github.ref_name }}-windows-x64-cli.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Test and package for Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-tk libpcap-dev iproute2 isc-dhcp-client xvfb xauth
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv .build-venv-linux
+          .build-venv-linux/bin/python -m pip install -e "mentohust-modern[build]"
+
+      - name: Run tests
+        run: .build-venv-linux/bin/python -m unittest discover -s ./mentohust-modern/tests -t ./mentohust-modern
+
+      - name: Build application
+        run: bash ./mentohust-modern/tools/build_linux.sh
+
+      - name: Check minimum supported GLIBC version
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          limit = (2, 35)
+          highest = (0, 0)
+          for path in Path('dist').rglob('*'):
+              if not path.is_file():
+                  continue
+              with path.open('rb') as binary:
+                  if binary.read(4) != b'\x7fELF':
+                      continue
+              result = subprocess.run(
+                  ['readelf', '--version-info', '--wide', str(path)],
+                  check=True, capture_output=True, text=True,
+              )
+              versions = [tuple(map(int, match)) for match in re.findall(r'GLIBC_(\d+)\.(\d+)', result.stdout)]
+              if versions:
+                  highest = max(highest, *versions)
+                  if max(versions) > limit:
+                      raise SystemExit(f'{path} needs GLIBC {max(versions)}, above {limit}')
+          print(f'Highest bundled GLIBC requirement: {highest[0]}.{highest[1]}')
+          PY
+
+      - name: Smoke test packaged GUI
+        run: |
+          set +e
+          sudo timeout --signal=TERM --kill-after=3s 8s xvfb-run -a "./dist/MentoHUST Modern/MentoHUST Modern" > gui-smoke.log 2>&1
+          status=$?
+          cat gui-smoke.log
+          test "$status" -eq 124 -o "$status" -eq 137
+
+      - name: Smoke test headless CLI
+        run: |
+          if find dist/mentohust-modern-cli \( -iname 'libtk*' -o -iname 'tkinter' -o -iname '_tkinter*' \) | grep -q .; then
+            echo 'CLI package unexpectedly contains Tk' >&2
+            exit 1
+          fi
+          env -u DISPLAY -u WAYLAND_DISPLAY ./dist/mentohust-modern-cli/mentohust-modern-cli --help
+          interfaces="$(env -u DISPLAY -u WAYLAND_DISPLAY ./dist/mentohust-modern-cli/mentohust-modern-cli --list-interfaces)"
+          printf '%s\n' "$interfaces"
+          interface_name="$(printf '%s\n' "$interfaces" | cut -f1 | sed -n '1p')"
+          test -n "$interface_name"
+          env -u DISPLAY -u WAYLAND_DISPLAY ./dist/mentohust-modern-cli/mentohust-modern-cli --config "$RUNNER_TEMP/mentohust-cli.json" --init-config --interface "$interface_name"
+          python3 -c 'import json,sys; path=sys.argv[1]; config=json.load(open(path, encoding="utf-8")); assert config["dhcp_script"] == config["client_exe"] == ""; config["username"]="ci-user"; config["password"]="ci-password"; json.dump(config, open(path,"w",encoding="utf-8"))' "$RUNNER_TEMP/mentohust-cli.json"
+          env -u DISPLAY -u WAYLAND_DISPLAY ./dist/mentohust-modern-cli/mentohust-modern-cli --config "$RUNNER_TEMP/mentohust-cli.json" --check
+
+      - name: Create release archive and checksum
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          archive_name="MentoHUST-Modern-${RELEASE_TAG}-linux-${ARCH}.tar.gz"
+          cli_archive_name="MentoHUST-Modern-${RELEASE_TAG}-linux-${ARCH}-cli.tar.gz"
+          tar -czf "$archive_name" -C dist "MentoHUST Modern"
+          tar -czf "$cli_archive_name" -C dist "mentohust-modern-cli"
+          sha256sum "$archive_name" > "$archive_name.sha256"
+          sha256sum "$cli_archive_name" > "$cli_archive_name.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: MentoHUST-Modern-${{ github.ref_name }}-linux-${{ matrix.arch }}
+          path: |
+            MentoHUST-Modern-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
+            MentoHUST-Modern-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz.sha256
+            MentoHUST-Modern-${{ github.ref_name }}-linux-${{ matrix.arch }}-cli.tar.gz
+            MentoHUST-Modern-${{ github.ref_name }}-linux-${{ matrix.arch }}-cli.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: MentoHUST-*-${{ github.ref_name }}-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Create release and attach builds
+        uses: softprops/action-gh-release@v3
+        with:
+          name: MentoHUST Modern ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*

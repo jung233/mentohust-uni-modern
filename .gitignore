@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+.build-venv/
+.build-venv-linux/
+
+# 3rd tools
+/tools
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# Editor / IDE
+.vs/f
+.vscode/
+.idea/
+*.suo
+*.user
+*.VC.db
+
+# Native build outputs
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.ipch
+*.aps
+*.ncb
+*.sdf
+*.opensdf
+
+# Local runtime data
+*.log
+config.json
+*.local.json
+Ruijie Supplicant/logs/
+
+# Agents Notes
+AGENTS.md
